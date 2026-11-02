@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - chatgpt-provincial-ich-fetch-20261030
+  pull_request:
+    branches:
+      - main
   workflow_dispatch:
 
 permissions:
@@ -49,7 +52,6 @@ jobs:
                   "Accept": "application/json",
                   "User-Agent": "Academic-ICH-Registry-Research/1.0",
               })
-              last_error = None
               for attempt in range(1, 7):
                   try:
                       with urllib.request.urlopen(req, timeout=60) as response:
@@ -57,8 +59,7 @@ jobs:
                           if not data_version:
                               data_version = response.headers.get("X-Data-Version-ICH", "")
                       break
-                  except Exception as exc:
-                      last_error = exc
+                  except Exception:
                       if attempt == 6:
                           raise
                       time.sleep(min(30, 2 ** attempt))
