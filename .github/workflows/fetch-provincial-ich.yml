@@ -29,9 +29,8 @@ jobs:
             --referer 'https://geodoi.ac.cn/WebCn/geodoi.aspx?ID=3650' \
             'https://geodoi.ac.cn/WebCn/down.aspx?fileID=8796&size=10884116' \
             --output work/ProvICH_China_2005-2024.rar
-          7z l work/ProvICH_China_2005-2024.rar | tee output/archive_listing.txt
           7z x -y work/ProvICH_China_2005-2024.rar -oextracted
-          find extracted -type f -printf '%p\t%s bytes\n' | sort | tee output/extracted_files.txt
+          find extracted -type f -printf '%p\t%s bytes\n' | sort > output/extracted_files.txt
 
       - name: Filter traditional-dance project records
         shell: bash
@@ -44,96 +43,56 @@ jobs:
           from pathlib import Path
           import shapefile
 
-          root = Path('extracted')
+          shp_path = Path('extracted/ProvICH_China_2005-2024shp/ProvICH_Projects.shp')
           out = Path('output')
-          candidates = []
-          encodings = ['gb18030', 'gbk', 'cp936', 'utf-8', 'latin1']
-
-          for shp_path in sorted(root.rglob('*.shp')):
-              success = None
-              last_error = None
-              for enc in encodings:
-                  try:
-                      reader = shapefile.Reader(str(shp_path), encoding=enc)
-                      fields = [f[0] for f in reader.fields[1:]]
-                      count = len(reader)
-                      preview = []
-                      for idx, record in enumerate(reader.iterRecords()):
-                          preview.append(dict(zip(fields, list(record))))
-                          if idx >= 1:
-                              break
-                      success = {
-                          'path': str(shp_path),
-                          'encoding': enc,
-                          'count': count,
-                          'fields': fields,
-                          'preview': preview,
-                      }
-                      break
-                  except Exception as exc:
-                      last_error = repr(exc)
-              if success:
-                  candidates.append(success)
-                  print(json.dumps(success, ensure_ascii=False, indent=2, default=str)[:8000])
-              else:
-                  candidates.append({'path': str(shp_path), 'error': last_error})
-
-          (out / 'shapefile_inventory.json').write_text(
-              json.dumps(candidates, ensure_ascii=False, indent=2, default=str),
-              encoding='utf-8'
+          reader = shapefile.Reader(
+              str(shp_path),
+              encoding='utf-8',
+              encodingErrors='replace',
           )
-
-          # The project layer contains 20,924 records according to the dataset paper.
-          project_layers = [c for c in candidates if c.get('count') == 20924]
-          if not project_layers:
-              project_layers = [c for c in candidates if 19000 <= c.get('count', 0) <= 21500]
-          if not project_layers:
-              raise RuntimeError('Could not identify the provincial project layer near 20,924 records.')
-
-          selected = project_layers[0]
-          shp_path = Path(selected['path'])
-          reader = shapefile.Reader(str(shp_path), encoding=selected['encoding'])
           fields = [f[0] for f in reader.fields[1:]]
           rows = []
+          replacement_char_rows = 0
 
-          for shape_record in reader.iterShapeRecords():
-              record = dict(zip(fields, list(shape_record.record)))
-              values = [str(v).strip() for v in record.values()]
-              if not any(v == '传统舞蹈' or '传统舞蹈' in v for v in values):
+          for record in reader.iterRecords():
+              row = dict(zip(fields, list(record)))
+              if str(row.get('CategoryCN', '')).strip() != '传统舞蹈':
                   continue
-              row = {k: ('' if v is None else v) for k, v in record.items()}
-              row['_source_shapefile'] = str(shp_path)
-              if shape_record.shape.points:
-                  row['_longitude'] = shape_record.shape.points[0][0]
-                  row['_latitude'] = shape_record.shape.points[0][1]
-              else:
-                  row['_longitude'] = ''
-                  row['_latitude'] = ''
-              rows.append(row)
+              clean = {}
+              has_replacement = False
+              for key, value in row.items():
+                  if value is None:
+                      value = ''
+                  if isinstance(value, float) and value.is_integer() and key in {'Index', 'Time'}:
+                      value = int(value)
+                  if '\ufffd' in str(value):
+                      has_replacement = True
+                  clean[key] = value
+              clean['_source_shapefile'] = str(shp_path)
+              clean['_encoding_warning'] = '含替换字符，需回查原始名录' if has_replacement else ''
+              replacement_char_rows += int(has_replacement)
+              rows.append(clean)
 
           if not rows:
-              raise RuntimeError('The project layer was found, but no records containing 传统舞蹈 were detected.')
+              raise RuntimeError('No records with CategoryCN=传统舞蹈 were found.')
 
-          output_fields = fields + ['_source_shapefile', '_longitude', '_latitude']
+          output_fields = fields + ['_source_shapefile', '_encoding_warning']
           with (out / 'provincial_traditional_dance_projects.csv').open('w', encoding='utf-8-sig', newline='') as fh:
               writer = csv.DictWriter(fh, fieldnames=output_fields, extrasaction='ignore')
               writer.writeheader()
               writer.writerows(rows)
 
-          with (out / 'provincial_traditional_dance_projects.json').open('w', encoding='utf-8') as fh:
-              json.dump({
-                  'selected_layer': selected,
-                  'record_count': len(rows),
-                  'records': rows,
-              }, fh, ensure_ascii=False, indent=2, default=str)
-
           summary = {
-              'selected_layer': selected,
+              'source_layer': str(shp_path),
+              'source_record_count': len(reader),
               'traditional_dance_record_count': len(rows),
+              'rows_with_encoding_replacement': replacement_char_rows,
               'output_fields': output_fields,
           }
-          (out / 'summary.json').write_text(json.dumps(summary, ensure_ascii=False, indent=2, default=str), encoding='utf-8')
-          print(json.dumps(summary, ensure_ascii=False, indent=2, default=str))
+          with (out / 'provincial_traditional_dance_projects.json').open('w', encoding='utf-8') as fh:
+              json.dump({'summary': summary, 'records': rows}, fh, ensure_ascii=False, indent=2, default=str)
+          (out / 'summary.json').write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding='utf-8')
+          print(json.dumps(summary, ensure_ascii=False, indent=2))
           PY
 
       - name: Upload filtered records
