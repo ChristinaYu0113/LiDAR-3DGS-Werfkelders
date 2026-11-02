@@ -1,4 +1,4 @@
-name: Download provincial ICH dataset archive
+name: Extract provincial traditional-dance ICH records
 
 on:
   push:
@@ -13,29 +13,133 @@ permissions:
   contents: read
 
 jobs:
-  download-dataset:
+  extract-data:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
-      - name: Download GeoDOI provincial ICH archive
+      - name: Download and extract GeoDOI archive
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p provincial_ich_archive
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq p7zip-full
+          mkdir -p work extracted output
           curl --fail --location --retry 5 --retry-delay 2 \
             --user-agent 'Mozilla/5.0' \
             --referer 'https://geodoi.ac.cn/WebCn/geodoi.aspx?ID=3650' \
             'https://geodoi.ac.cn/WebCn/down.aspx?fileID=8796&size=10884116' \
-            --output provincial_ich_archive/ProvICH_China_2005-2024.rar
-          ls -lh provincial_ich_archive/ProvICH_China_2005-2024.rar
-          file provincial_ich_archive/ProvICH_China_2005-2024.rar
-          test "$(stat -c%s provincial_ich_archive/ProvICH_China_2005-2024.rar)" -gt 1000000
-          sha256sum provincial_ich_archive/ProvICH_China_2005-2024.rar > provincial_ich_archive/SHA256SUMS.txt
+            --output work/ProvICH_China_2005-2024.rar
+          7z l work/ProvICH_China_2005-2024.rar | tee output/archive_listing.txt
+          7z x -y work/ProvICH_China_2005-2024.rar -oextracted
+          find extracted -type f -printf '%p\t%s bytes\n' | sort | tee output/extracted_files.txt
 
-      - name: Upload dataset archive
+      - name: Filter traditional-dance project records
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet pyshp
+          python <<'PY'
+          import csv
+          import json
+          from pathlib import Path
+          import shapefile
+
+          root = Path('extracted')
+          out = Path('output')
+          candidates = []
+          encodings = ['gb18030', 'gbk', 'cp936', 'utf-8', 'latin1']
+
+          for shp_path in sorted(root.rglob('*.shp')):
+              success = None
+              last_error = None
+              for enc in encodings:
+                  try:
+                      reader = shapefile.Reader(str(shp_path), encoding=enc)
+                      fields = [f[0] for f in reader.fields[1:]]
+                      count = len(reader)
+                      preview = []
+                      for idx, record in enumerate(reader.iterRecords()):
+                          preview.append(dict(zip(fields, list(record))))
+                          if idx >= 1:
+                              break
+                      success = {
+                          'path': str(shp_path),
+                          'encoding': enc,
+                          'count': count,
+                          'fields': fields,
+                          'preview': preview,
+                      }
+                      break
+                  except Exception as exc:
+                      last_error = repr(exc)
+              if success:
+                  candidates.append(success)
+                  print(json.dumps(success, ensure_ascii=False, indent=2, default=str)[:8000])
+              else:
+                  candidates.append({'path': str(shp_path), 'error': last_error})
+
+          (out / 'shapefile_inventory.json').write_text(
+              json.dumps(candidates, ensure_ascii=False, indent=2, default=str),
+              encoding='utf-8'
+          )
+
+          # The project layer contains 20,924 records according to the dataset paper.
+          project_layers = [c for c in candidates if c.get('count') == 20924]
+          if not project_layers:
+              project_layers = [c for c in candidates if 19000 <= c.get('count', 0) <= 21500]
+          if not project_layers:
+              raise RuntimeError('Could not identify the provincial project layer near 20,924 records.')
+
+          selected = project_layers[0]
+          shp_path = Path(selected['path'])
+          reader = shapefile.Reader(str(shp_path), encoding=selected['encoding'])
+          fields = [f[0] for f in reader.fields[1:]]
+          rows = []
+
+          for shape_record in reader.iterShapeRecords():
+              record = dict(zip(fields, list(shape_record.record)))
+              values = [str(v).strip() for v in record.values()]
+              if not any(v == '传统舞蹈' or '传统舞蹈' in v for v in values):
+                  continue
+              row = {k: ('' if v is None else v) for k, v in record.items()}
+              row['_source_shapefile'] = str(shp_path)
+              if shape_record.shape.points:
+                  row['_longitude'] = shape_record.shape.points[0][0]
+                  row['_latitude'] = shape_record.shape.points[0][1]
+              else:
+                  row['_longitude'] = ''
+                  row['_latitude'] = ''
+              rows.append(row)
+
+          if not rows:
+              raise RuntimeError('The project layer was found, but no records containing 传统舞蹈 were detected.')
+
+          output_fields = fields + ['_source_shapefile', '_longitude', '_latitude']
+          with (out / 'provincial_traditional_dance_projects.csv').open('w', encoding='utf-8-sig', newline='') as fh:
+              writer = csv.DictWriter(fh, fieldnames=output_fields, extrasaction='ignore')
+              writer.writeheader()
+              writer.writerows(rows)
+
+          with (out / 'provincial_traditional_dance_projects.json').open('w', encoding='utf-8') as fh:
+              json.dump({
+                  'selected_layer': selected,
+                  'record_count': len(rows),
+                  'records': rows,
+              }, fh, ensure_ascii=False, indent=2, default=str)
+
+          summary = {
+              'selected_layer': selected,
+              'traditional_dance_record_count': len(rows),
+              'output_fields': output_fields,
+          }
+          (out / 'summary.json').write_text(json.dumps(summary, ensure_ascii=False, indent=2, default=str), encoding='utf-8')
+          print(json.dumps(summary, ensure_ascii=False, indent=2, default=str))
+          PY
+
+      - name: Upload filtered records
         uses: actions/upload-artifact@v4
         with:
-          name: provincial-ich-dataset-archive
-          path: provincial_ich_archive
+          name: provincial-traditional-dance-records
+          path: output
           if-no-files-found: error
           retention-days: 7
